@@ -31,7 +31,7 @@ no backend, no hosting cost. Native Android app built in Kotlin.
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│  BikeRyde — native Android app (Kotlin, Jetpack Compose)  │
+│  BikeRyde — native Android app (Kotlin, Views/Fragments)  │
 │                                                           │
 │  ┌────────────────┐   ┌────────────────┐                  │
 │  │ GPS tracking   │   │ Render engine  │                  │
@@ -42,7 +42,7 @@ no backend, no hosting cost. Native Android app built in Kotlin.
 │           v                    v                          │
 │  ┌─────────────────────────────────────────┐              │
 │  │ Local storage                           │              │
-│  │ Room (SQLite) — structured data         │              │
+│  │ SQLite — structured data                │              │
 │  │ App-scoped storage — photos, video      │              │
 │  └───────────────────┬─────────────────────┘              │
 │                      │                                    │
@@ -70,10 +70,11 @@ user's own credentials, and native Android APIs are used directly with no cross-
 | Layer | Choice | Notes |
 |---|---|---|
 | Language | Kotlin | Java fully interoperable if ever needed |
-| UI | Jetpack Compose | Modern declarative UI, replaces XML layouts |
-| Architecture pattern | MVVM (ViewModel + StateFlow) | Standard, testable, works cleanly with Compose |
-| Dependency injection | Hilt | Reduces boilerplate for repositories/use cases |
-| Local structured data | Room (SQLite) | Rides, GPS points, fuel logs, settings |
+| UI | XML layouts + Fragments, Jetpack Navigation component | Simple, mature, no extra build tooling |
+| State | Kotlin `StateFlow` state holders | Tracking services publish state that Fragments observe |
+| Dependency injection | Manual wiring | App is small enough that a DI framework isn't worth the overhead |
+| Local structured data | SQLite via `SQLiteOpenHelper` (`RideDbHelper`, singleton) | Rides, GPS points, stops, fuel logs |
+| Settings | `SharedPreferences` (`EncryptedSharedPreferences` for API keys) | Key-value settings |
 | Local blobs | App-scoped internal storage (`filesDir`) | Photos, rendered videos, cached geocode results |
 | Background GPS | `FusedLocationProviderClient` + `ForegroundService` | Persistent notification while tracking, per Android background-location requirements |
 | Video rendering | `MediaCodec` / Media3 Transformer (hardware-accelerated) | Target 1080p60, fallback 1080p30 on devices without hardware support |
@@ -87,11 +88,11 @@ user's own credentials, and native Android APIs are used directly with no cross-
 | Networking | Retrofit + OkHttp | |
 | Async | Kotlin Coroutines + Flow | |
 | Image loading | Coil | |
-| Charts (fuel trends) | Vico or custom Compose canvas charts | |
+| Charts (fuel trends) | Custom `View` drawn on a `Canvas` (`TrendLineChartView`) | |
 
 ---
 
-## 4. Data model (Room entities)
+## 4. Data model (SQLite tables)
 
 **Ride**
 ```
@@ -142,7 +143,7 @@ id, title, destination, dateRangeStart, dateRangeEnd, weatherSnapshot (JSON),
 suggestions (JSON: food/sightseeing/lodging), generatedBy (LOCAL | CLOUD)
 ```
 
-**AppSettings** (DataStore, not Room, for key-value settings)
+**AppSettings** (`SharedPreferences`, not SQLite, for key-value settings)
 ```
 apiKeys (weather, places, routing, aiCloud) — stored via EncryptedSharedPreferences,
 aiMode (LOCAL | CLOUD), driveSyncEnabled (Boolean), units (KM | MI)
@@ -160,7 +161,7 @@ aiMode (LOCAL | CLOUD), driveSyncEnabled (Boolean), units (KM | MI)
 ### 5.2 Ride tracking — multi day
 - **Start trip** once, at the beginning of the whole journey
 - Per day: **Start day** → tracking → **Pause day** (end of riding for that day) or **End day** if final
-- Each start/pause/end action captures a `Stop` (timestamp + lat/lng), reverse-geocoded once to a place name, cached locally in Room so repeat renders don't re-query
+- Each start/pause/end action captures a `Stop` (timestamp + lat/lng), reverse-geocoded once to a place name, cached locally in SQLite so repeat renders don't re-query
 - **End trip** closes out the whole multi-day ride and triggers the trip summary
 - A day can also be logged as **not travelling** — a rest day or a day spent sightseeing/touring at
   the current stop, with no start/pause/end tracking. This creates a `NOT_TRAVEL` `RideDay` (same
@@ -171,7 +172,7 @@ aiMode (LOCAL | CLOUD), driveSyncEnabled (Boolean), units (KM | MI)
 
 ### 5.3 Graphics & video rendering
 - Available for both single-day and multi-day rides
-- **Static image**: composited on-demand via Compose `Canvas`/`ImageBitmap` drawing — route map + stats overlay, near-instant
+- **Static image**: composited on-demand via `android.graphics.Canvas`/`Bitmap` drawing — route map + stats overlay, near-instant
 - **Animated video**: queued as a `WorkManager` background job
   - `ForegroundService` + persistent notification: "Rendering ride video… 42%"
   - On completion: notification "Your ride video is ready" → tapping opens preview/export screen
@@ -182,7 +183,7 @@ aiMode (LOCAL | CLOUD), driveSyncEnabled (Boolean), units (KM | MI)
 
 ### 5.4 Fuel tracking
 - Form at each fill-up: odometer reading, liters filled, total cost
-- App derives price/liter and mileage since last fill automatically (Room query against the previous `FuelLog` entry)
+- App derives price/liter and mileage since last fill automatically (SQL query against the previous `FuelLog` entry)
 - History screen with trend charts (cost over time, mileage over time)
 
 ### 5.5 AI-assisted ride planning
@@ -207,7 +208,7 @@ aiMode (LOCAL | CLOUD), driveSyncEnabled (Boolean), units (KM | MI)
 ### 5.7 Sync (optional)
 - Google Drive, user's own account, app-scoped file access (Drive `appDataFolder` or a user-visible dedicated folder)
 - Manual "Sync now" button plus optional sync-on-app-open
-- Structured data (rides, fuel logs, plans) synced as a JSON export from Room; photos/videos optionally included if the user allows larger uploads
+- Structured data (rides, fuel logs, plans) synced as a JSON export from SQLite; photos/videos optionally included if the user allows larger uploads
 - Last-write-wins; single-user multi-device use, not real-time collaboration
 
 ---
@@ -245,7 +246,7 @@ aiMode (LOCAL | CLOUD), driveSyncEnabled (Boolean), units (KM | MI)
 - **MediaPipe/Gemma model size vs. app install size** — bundling a multi-GB model in the APK isn't practical; plan for on-first-use download with clear user consent, stored in app-scoped storage
 - **Foreground service + battery drain** — full-day GPS tracking with a persistent notification will noticeably drain battery; worth surfacing an estimated battery-per-hour figure during long multi-day trips
 - **Android 14+ foreground service type requirements** — location-type foreground services now require explicit manifest declarations and runtime checks; needs to be verified against the target SDK at build time since this tightens with each Android release
-- **Reverse-geocoding rate limits on free tiers** (Nominatim) — fine at personal-use volume, but cache aggressively in Room regardless since place names for a given coordinate never change
+- **Reverse-geocoding rate limits on free tiers** (Nominatim) — fine at personal-use volume, but cache aggressively in SQLite regardless since place names for a given coordinate never change
 - **EncryptedSharedPreferences / Keystore behavior across OEMs** — some manufacturers have historically had quirks with Android Keystore; worth testing on a couple of different device brands before relying on it for API key storage
 
 ---

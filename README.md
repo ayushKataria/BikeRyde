@@ -9,9 +9,7 @@ See [`BIKERYDE_DESIGNDOC.md`](./BIKERYDE_DESIGNDOC.md) for the full design and s
 
 ## Status
 
-Early development, built directly with Views/Fragments (not yet on the Compose/Room/Hilt stack
-the original spec called for — see [Tech stack](#tech-stack)). Build order follows the phases in
-the spec doc:
+Early development. Build order follows the phases in the spec doc:
 
 1. Core tracking + static graphics — **done**
 2. Multi-day tracking + video export — **done**
@@ -44,9 +42,6 @@ the spec doc:
 - Weather and places lookups via Open-Meteo and OpenStreetMap Nominatim/Overpass
 - Google Drive sync for multi-device backup/restore
 - Photo backgrounds and animation polish for rendered videos
-- Migration to Jetpack Compose, Room, and Hilt (current code uses XML layouts + Fragments +
-  Navigation component, a hand-rolled `RideDbHelper` SQLite wrapper, and manual dependency
-  wiring instead)
 - `EncryptedSharedPreferences` for API key storage (design spec §5.7; currently plain
   `SharedPreferences`)
 
@@ -55,15 +50,15 @@ the spec doc:
 Current implementation:
 
 - Kotlin, XML layouts + Fragments, Jetpack Navigation component
-- Plain `SharedPreferences`-backed repositories (no Room/Hilt yet)
-- Raw SQLite via a hand-rolled `RideDbHelper` for ride/fuel data
+- Kotlin Coroutines + `StateFlow` for tracking state
+- Raw SQLite via a `SQLiteOpenHelper` (`RideDbHelper`) for ride/fuel data
+- Plain `SharedPreferences`-backed repositories for settings
+- Manual dependency wiring (no DI framework)
 - `FusedLocationProviderClient` + `ForegroundService` for background GPS tracking
 - `MediaCodec` / `MediaMuxer` for hardware-accelerated video rendering, driven by WorkManager
 
 Planned (per the design spec, not yet wired in):
 
-- Jetpack Compose UI, MVVM (ViewModel + StateFlow), Hilt for DI
-- Room for structured data
 - MediaPipe LLM Inference API (Gemma) for on-device AI planning, with a cloud AI toggle
 - Open-Meteo and OpenStreetMap Nominatim/Overpass for weather and places (free, no key required)
 - Google Drive REST API for optional multi-device sync
