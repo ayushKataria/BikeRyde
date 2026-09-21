@@ -13,7 +13,7 @@ Early development. Build order follows the phases in the spec doc:
 
 1. Core tracking + static graphics — **done**
 2. Multi-day tracking + video export — **done**
-3. Photo backgrounds + animation polish — in progress
+3. Photo backgrounds + animation polish — **done** (see [Known gaps](#known-gaps))
 4. AI ride planning — not started
 5. Google Drive sync — not started
 
@@ -26,9 +26,12 @@ Early development. Build order follows the phases in the spec doc:
   (`MultiDayRideTrackingService`, `StillRidingWatchdog`, `StillRidingNotifier`)
 - Ride history, ride detail, and stop grouping/renaming along a route
 - Static route image rendering (`StaticImageRenderer`, `RouteFrameDrawer`)
-- Animated multi-day trip video rendering via `MediaCodec`/`MediaMuxer`, run in the background
-  through WorkManager (`VideoRenderWorker`), with per-day photos and captions, stop exclusion,
-  and duration customization
+- Animated trip video rendering via `MediaCodec`/`MediaMuxer`, run in the background through
+  WorkManager (`VideoRenderWorker`), with stop exclusion and duration customization; targets
+  1080p60 and falls back to 30fps when the device's H.264 encoder can't sustain 60
+- Photo backgrounds on rendered output: a cover photo for a static image, per-stop photos
+  (crossfaded) for a single-day video, and per-day photos plus optional day captions for a
+  multi-day video (`RenderEditFragment`, `RouteFrameDrawer`)
 - Fuel log tracking with fill-up entries and a mileage trend chart (`FuelLogFragment`,
   `TrendLineChartView`)
 - Local settings for units, AI mode, and API key fields (stored in plain
@@ -41,9 +44,21 @@ Early development. Build order follows the phases in the spec doc:
 - On-device AI planning via MediaPipe LLM Inference (Gemma), with a cloud AI toggle
 - Weather and places lookups via Open-Meteo and OpenStreetMap Nominatim/Overpass
 - Google Drive sync for multi-device backup/restore
-- Photo backgrounds and animation polish for rendered videos
 - `EncryptedSharedPreferences` for API key storage (design spec §5.7; currently plain
   `SharedPreferences`)
+
+### Known gaps
+
+Small hardening items left over from the finished phases, not missing features:
+
+- **Video encoder fallback.** The frame rate falls back from 60 to 30fps, but the resolution is
+  fixed at 1080x1920: a device with no H.264 encoder that supports it fails the render, with no
+  lower-resolution or software-encoder fallback (design spec §8). The 60→30 fallback has not been
+  exercised on a low-end device.
+- **Render photo cleanup.** Photos picked for a render are copied into app storage
+  (`render_backgrounds`) and are not deleted when replaced, removed, or when the customize screen is
+  left without generating. The design spec's `Photo` entity linking photos to rides is not
+  implemented.
 
 ## Tech stack
 

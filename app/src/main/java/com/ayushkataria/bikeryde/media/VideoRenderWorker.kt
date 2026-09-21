@@ -116,25 +116,44 @@ class VideoRenderWorker(appContext: Context, params: WorkerParameters) : Corouti
     }
 
     /**
-     * Picks the highest frame rate the device's H.264 encoder actually supports at [WIDTH]x[HEIGHT]
-     * — 60fps target, falling back to 30fps — per the design doc's capability-detection open question,
-     * rather than assuming hardware support and failing mid-render.
+     * Every part of the encoder configuration except the frame rate, which is only known after
+     * probing the device ([chooseEncoder]). The probe and the real configure use this same format,
+     * so the encoder that gets probed is one that can actually take the real configuration.
      */
-    private fun chooseFrameRate(): Int {
+    private fun baseVideoFormat(): MediaFormat =
+        MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH, HEIGHT).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
+
+    /** The H.264 encoder to render with ([codecName], null if none matched) and the frame rate it can sustain. */
+    private class EncoderChoice(val codecName: String?, val fps: Int)
+
+    /**
+     * Picks the H.264 encoder and the highest frame rate it actually supports at [WIDTH]x[HEIGHT] —
+     * 60fps target, falling back to 30fps — per the design doc's capability-detection open question,
+     * rather than assuming hardware support and failing mid-render. The frame rate is checked against
+     * the very encoder returned here, and the render must create that same one by name: asking for
+     * "any H.264 encoder" instead could hand back a different codec than the one that was probed.
+     */
+    private fun chooseEncoder(): EncoderChoice {
         return try {
             val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH, HEIGHT)
-            val encoderName = codecList.findEncoderForFormat(format) ?: return FALLBACK_FPS
-            val codecInfo = codecList.codecInfos.first { it.name == encoderName }
+            val codecName = codecList.findEncoderForFormat(baseVideoFormat())
+                ?: return EncoderChoice(null, FALLBACK_FPS)
+            val codecInfo = codecList.codecInfos.first { it.name == codecName }
             val videoCaps = codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities
-            if (videoCaps?.areSizeAndRateSupported(WIDTH, HEIGHT, TARGET_FPS.toDouble()) == true) TARGET_FPS else FALLBACK_FPS
+            val supports60 = videoCaps?.areSizeAndRateSupported(WIDTH, HEIGHT, TARGET_FPS.toDouble()) == true
+            EncoderChoice(codecName, if (supports60) TARGET_FPS else FALLBACK_FPS)
         } catch (e: Exception) {
-            FALLBACK_FPS
+            EncoderChoice(null, FALLBACK_FPS)
         }
     }
 
     private suspend fun renderToFile(data: RideRenderData, durationS: Int, onProgress: suspend (Int) -> Unit): Pair<File, Int> {
-        val fps = chooseFrameRate()
+        val encoderChoice = chooseEncoder()
+        val fps = encoderChoice.fps
         // The animation itself sweeps progress 0..1 across animationFrameCount frames (the
         // duration the rider chose/customized); lingerFrameCount then holds on the completed
         // route — full path, all stops, final stats — at the ride's last stop, so the video
@@ -150,13 +169,9 @@ class VideoRenderWorker(appContext: Context, params: WorkerParameters) : Corouti
         // render time and playback smoothness.
         val preparedRender = RouteFrameDrawer.prepare(WIDTH, HEIGHT, data)
 
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, WIDTH, HEIGHT).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE)
-            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-        }
-        val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        val format = baseVideoFormat().apply { setInteger(MediaFormat.KEY_FRAME_RATE, fps) }
+        val encoder = encoderChoice.codecName?.let { MediaCodec.createByCodecName(it) }
+            ?: MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         val inputSurface = encoder.createInputSurface()
         encoder.start()
