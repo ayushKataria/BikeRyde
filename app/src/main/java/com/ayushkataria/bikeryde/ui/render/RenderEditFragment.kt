@@ -1,7 +1,6 @@
 package com.ayushkataria.bikeryde.ui.render
 
 import android.graphics.Bitmap
-import android.net.Uri
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
@@ -16,7 +15,9 @@ import androidx.core.os.bundleOf
 import androidx.core.widget.doAfterTextChanged
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.navigation.NavOptions
 import androidx.navigation.fragment.findNavController
 import androidx.work.Data
@@ -26,15 +27,13 @@ import androidx.work.WorkManager
 import com.ayushkataria.bikeryde.R
 import com.ayushkataria.bikeryde.media.MergedStop
 import com.ayushkataria.bikeryde.media.RenderImageStorage
-import com.ayushkataria.bikeryde.media.RenderRepository
 import com.ayushkataria.bikeryde.media.RenderType
-import com.ayushkataria.bikeryde.media.RideRenderDataAssembler
-import com.ayushkataria.bikeryde.media.StaticImageRenderer
 import com.ayushkataria.bikeryde.media.VideoDurationRecommender
 import com.ayushkataria.bikeryde.media.VideoRenderWorker
 import com.ayushkataria.bikeryde.ride.RideDay
 import com.ayushkataria.bikeryde.ride.RideDayType
 import com.ayushkataria.bikeryde.ride.RideEventAction
+import com.ayushkataria.bikeryde.ui.render.RenderEditViewModel.Event
 import com.ayushkataria.bikeryde.ui.render.RenderEditViewModel.PickTarget
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.checkbox.MaterialCheckBox
@@ -42,7 +41,6 @@ import com.google.android.material.slider.Slider
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
 import kotlinx.coroutines.launch
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -54,7 +52,9 @@ import java.util.Locale
  * day instead — see [daySection].
  *
  * All loaded data and every edit lives in [RenderEditViewModel] so it survives a configuration
- * change; this Fragment only owns the views and rebuilds them from that state.
+ * change; this Fragment only owns the views and rebuilds them from that state. The photo copy and
+ * static-image render run in the ViewModel too, so a rotation can't cancel them — this Fragment
+ * just reacts to their outcomes ([RenderEditViewModel.events], [RenderEditViewModel.isRendering]).
  */
 class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
 
@@ -85,7 +85,7 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
     private val pickImageLauncher = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         val target = viewModel.pendingPickTarget
         viewModel.pendingPickTarget = null
-        if (uri != null && target != null) onImagePicked(target, uri)
+        if (uri != null && target != null) viewModel.onImagePicked(target, uri)
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
@@ -135,13 +135,25 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
             }
         }
 
-        viewModel.coverImagePath?.let { path ->
-            viewLifecycleOwner.lifecycleScope.launch {
-                loadThumbnail(path)?.let { showCoverImage(it) }
+        restoreCoverImage()
+        loadEditRows()
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                launch { viewModel.isRendering.collect { generateButton.isEnabled = !it } }
+                launch { viewModel.events.collect(::onEvent) }
             }
         }
+    }
 
-        loadEditRows()
+    private fun onEvent(event: Event) {
+        when (event) {
+            is Event.ImagePicked -> showPickedImage(event.target)
+            Event.ImagePickFailed -> Toast.makeText(requireContext(), R.string.render_image_failed, Toast.LENGTH_SHORT).show()
+            is Event.ImageRenderDone ->
+                navigateToPreview(RenderPreviewFragment.args(rideId, RenderType.IMAGE, event.uri.toString()))
+            Event.ImageRenderFailed -> Toast.makeText(requireContext(), R.string.render_image_failed, Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun loadEditRows() {
@@ -196,6 +208,10 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
         dayThumbnails[day.dayIndex] = thumbnail
         viewModel.dayBackgroundPaths[day.dayIndex]?.let { path -> restoreThumbnail(thumbnail, path) }
 
+        // Every row is inflated from the same layout, so its views share one ID and Android's own
+        // ID-keyed view-state restore would copy the last row's value into all of them (and, with the
+        // listeners below attached, back into the ViewModel). The ViewModel is the source of truth.
+        captionInput.isSaveEnabled = false
         captionInput.setText(viewModel.dayCaption(day.dayIndex))
         captionInput.doAfterTextChanged { viewModel.setDayCaption(day.dayIndex, it?.toString().orEmpty()) }
         dayCaptionLayouts[day.dayIndex] = captionLayout
@@ -223,6 +239,9 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
             stop.placeName ?: getString(R.string.unknown_location),
             timeFormat.format(stop.timestamp)
         )
+        // Same shared-ID problem as the day captions above: restore from the ViewModel, not view state.
+        nameInput.isSaveEnabled = false
+        includeCheckbox.isSaveEnabled = false
         nameInput.setText(viewModel.stopName(index))
         nameInput.doAfterTextChanged { viewModel.setStopName(index, it?.toString().orEmpty()) }
 
@@ -276,45 +295,41 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
         pickImageLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
     }
 
-    private fun onImagePicked(target: PickTarget, uri: Uri) {
-        viewLifecycleOwner.lifecycleScope.launch {
-            val path = runCatching { RenderImageStorage.copyToAppStorage(requireContext(), uri) }.getOrNull()
-            if (path == null) {
-                Toast.makeText(requireContext(), R.string.render_image_failed, Toast.LENGTH_SHORT).show()
-                return@launch
+    /**
+     * Shows a photo the ViewModel just recorded for [target]. If that row's view isn't built yet (or
+     * was just rebuilt by a rotation) there's nothing to update here — the row reads the path from
+     * the ViewModel when it is built.
+     */
+    private fun showPickedImage(target: PickTarget) {
+        when (target) {
+            is PickTarget.Cover -> restoreCoverImage()
+            is PickTarget.Stop -> {
+                val thumbnail = stopThumbnails[target.index]
+                val path = viewModel.stopBackgroundPaths[target.index]
+                if (thumbnail != null && path != null) restoreThumbnail(thumbnail, path)
             }
-            // Decode the thumbnail from the copy we just made, not the picker's uri — a photo
-            // picker's content:// grant can fail to re-open by the time this runs, which
-            // setImageURI(uri) swallows silently (leaving the slot blank instead of erroring).
-            val thumbnail = loadThumbnail(path)
-            if (thumbnail == null) {
-                // Decoding failed (corrupt copy, unsupported format, oversized source) — treat this
-                // exactly like the copy failure above rather than silently recording a path that
-                // will fail to decode again, identically, when the actual render runs later.
-                Toast.makeText(requireContext(), R.string.render_image_failed, Toast.LENGTH_SHORT).show()
-                return@launch
-            }
-            // The path goes into the ViewModel even if the row's view isn't built yet (or was just
-            // rebuilt by a rotation) — the row picks it up from there when it is.
-            when (target) {
-                is PickTarget.Cover -> {
-                    viewModel.coverImagePath = path
-                    showCoverImage(thumbnail)
-                }
-                is PickTarget.Stop -> {
-                    viewModel.stopBackgroundPaths[target.index] = path
-                    stopThumbnails[target.index]?.let { applyThumbnail(it, thumbnail) }
-                }
-                is PickTarget.Day -> {
-                    viewModel.dayBackgroundPaths[target.dayIndex] = path
-                    dayThumbnails[target.dayIndex]?.let { applyThumbnail(it, thumbnail) }
-                }
+            is PickTarget.Day -> {
+                val thumbnail = dayThumbnails[target.dayIndex]
+                val path = viewModel.dayBackgroundPaths[target.dayIndex]
+                if (thumbnail != null && path != null) restoreThumbnail(thumbnail, path)
             }
         }
     }
 
-    private suspend fun loadThumbnail(path: String): Bitmap? =
-        runCatching { RenderImageStorage.decodeSampledBitmap(path, THUMBNAIL_SIZE_PX, THUMBNAIL_SIZE_PX) }.getOrNull()
+    private fun restoreCoverImage() {
+        val path = viewModel.coverImagePath ?: return
+        viewLifecycleOwner.lifecycleScope.launch {
+            loadThumbnail(path)?.let { showCoverImage(it) }
+        }
+    }
+
+    private suspend fun loadThumbnail(path: String): Bitmap? = runCatching {
+        RenderImageStorage.decodeSampledBitmap(
+            path,
+            RenderEditViewModel.THUMBNAIL_SIZE_PX,
+            RenderEditViewModel.THUMBNAIL_SIZE_PX
+        )
+    }.getOrNull()
 
     /** Re-shows an already-picked photo on a freshly built row. A photo that no longer decodes just leaves the slot blank. */
     private fun restoreThumbnail(view: ImageView, path: String) {
@@ -350,45 +365,15 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
     }
 
     private fun onGenerateClicked() {
-        val nameOverrides = viewModel.stopNameOverrides()
-        generateButton.isEnabled = false
-
         when (renderType) {
-            RenderType.IMAGE -> generateImage(nameOverrides)
-            RenderType.VIDEO -> generateVideo(nameOverrides)
-        }
-    }
-
-    private fun generateImage(nameOverrides: Map<Int, String>) {
-        viewLifecycleOwner.lifecycleScope.launch {
-            val renderRepository = RenderRepository(requireContext())
-            // This render replaces any previous preview for this ride — delete it now rather
-            // than leaving an orphaned preview file behind in app storage.
-            renderRepository.getLatest(rideId, RenderType.IMAGE)?.filePath?.let { path ->
-                runCatching { File(path).delete() }
-            }
-            val renderId = renderRepository.insertQueued(rideId, RenderType.IMAGE)
-            renderRepository.markProcessing(renderId)
-
-            val data = RideRenderDataAssembler(viewModel.repository).assemble(
-                rideId = rideId,
-                stopNameOverrides = nameOverrides,
-                excludedStopIndices = viewModel.excludedStopIndices,
-                coverImagePath = viewModel.coverImagePath
-            )
-            val output = data?.let { runCatching { StaticImageRenderer(requireContext()).render(it) }.getOrNull() }
-            generateButton.isEnabled = true
-            if (output == null) {
-                renderRepository.markFailed(renderId)
-                Toast.makeText(requireContext(), R.string.render_image_failed, Toast.LENGTH_LONG).show()
-                return@launch
-            }
-            renderRepository.markDone(renderId, output.filePath, StaticImageRenderer.RESOLUTION_LABEL, fps = 0)
-            navigateToPreview(RenderPreviewFragment.args(rideId, RenderType.IMAGE, output.uri.toString()))
+            // The ViewModel disables the button (via isRendering) and reports back through events.
+            RenderType.IMAGE -> viewModel.generateImage()
+            RenderType.VIDEO -> generateVideo(viewModel.stopNameOverrides())
         }
     }
 
     private fun generateVideo(nameOverrides: Map<Int, String>) {
+        generateButton.isEnabled = false
         val stopCount = viewModel.stops.size
         val namesArray: Array<String?> = Array(stopCount) { i -> nameOverrides[i].orEmpty() }
         val backgroundsArray: Array<String?> = Array(stopCount) { i -> viewModel.stopBackgroundPaths[i].orEmpty() }
@@ -445,7 +430,6 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
     private fun dpToPx(dp: Int): Int = (dp * resources.displayMetrics.density).toInt()
 
     companion object {
-        private const val THUMBNAIL_SIZE_PX = 400
         const val ARG_RIDE_ID = "rideId"
         const val ARG_RENDER_TYPE = "renderType"
 

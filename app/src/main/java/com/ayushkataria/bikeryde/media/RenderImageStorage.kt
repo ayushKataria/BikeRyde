@@ -19,9 +19,15 @@ object RenderImageStorage {
     suspend fun copyToAppStorage(context: Context, uri: Uri): String = withContext(Dispatchers.IO) {
         val dir = File(context.filesDir, "render_backgrounds").apply { mkdirs() }
         val file = File(dir, "bg_${System.currentTimeMillis()}_${(0..9999).random()}.jpg")
-        context.contentResolver.openInputStream(uri)?.use { input ->
-            file.outputStream().use { output -> input.copyTo(output) }
-        } ?: error("Unable to read picked image")
+        try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                file.outputStream().use { output -> input.copyTo(output) }
+            } ?: error("Unable to read picked image")
+        } catch (t: Throwable) {
+            // A failed or cancelled copy would otherwise leave a partial file behind in app storage.
+            file.delete()
+            throw t
+        }
         file.absolutePath
     }
 
