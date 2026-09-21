@@ -1,5 +1,6 @@
 package com.ayushkataria.bikeryde.ui.render
 
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -12,7 +13,9 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.core.os.bundleOf
+import androidx.core.widget.doAfterTextChanged
 import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
 import androidx.lifecycle.lifecycleScope
 import androidx.navigation.NavOptions
 import androidx.navigation.fragment.findNavController
@@ -29,11 +32,10 @@ import com.ayushkataria.bikeryde.media.RideRenderDataAssembler
 import com.ayushkataria.bikeryde.media.StaticImageRenderer
 import com.ayushkataria.bikeryde.media.VideoDurationRecommender
 import com.ayushkataria.bikeryde.media.VideoRenderWorker
-import com.ayushkataria.bikeryde.media.mergedStopsForRide
 import com.ayushkataria.bikeryde.ride.RideDay
 import com.ayushkataria.bikeryde.ride.RideDayType
 import com.ayushkataria.bikeryde.ride.RideEventAction
-import com.ayushkataria.bikeryde.ride.RideRepository
+import com.ayushkataria.bikeryde.ui.render.RenderEditViewModel.PickTarget
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.checkbox.MaterialCheckBox
 import com.google.android.material.slider.Slider
@@ -50,12 +52,16 @@ import java.util.Locale
  * photos before the actual render kicks off. A static image gets one cover photo; a single-day
  * video gets one photo per stop; a multi-day video gets one photo (and an optional caption) per
  * day instead — see [daySection].
+ *
+ * All loaded data and every edit lives in [RenderEditViewModel] so it survives a configuration
+ * change; this Fragment only owns the views and rebuilds them from that state.
  */
 class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
 
-    private lateinit var repository: RideRepository
-    private lateinit var renderType: RenderType
-    private var rideId: Long = -1L
+    private val viewModel: RenderEditViewModel by viewModels()
+
+    private val renderType: RenderType get() = viewModel.renderType
+    private val rideId: Long get() = viewModel.rideId
 
     private lateinit var coverImageCard: View
     private lateinit var coverImagePreview: ImageView
@@ -71,44 +77,19 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
     private lateinit var stopsContainer: ViewGroup
     private lateinit var generateButton: MaterialButton
 
-    private var stops: List<MergedStop> = emptyList()
-    private var rideDays: List<RideDay> = emptyList()
-    /** True only for a multi-day *video* — a multi-day static image still uses [coverImagePath] like a single-day one. */
-    private var useDayRows = false
-    private var coverImagePath: String? = null
-    private val stopBackgroundPaths = mutableMapOf<Int, String>()
+    // Views of the currently built rows, keyed by stop/day index so a picked photo can find its thumbnail.
     private val stopThumbnails = mutableMapOf<Int, ImageView>()
-    private val stopNameInputs = mutableMapOf<Int, TextInputEditText>()
-    private val excludedStopIndices = mutableSetOf<Int>()
-    private val dayBackgroundPaths = mutableMapOf<Int, String>()
     private val dayThumbnails = mutableMapOf<Int, ImageView>()
-    private val dayCaptionInputs = mutableMapOf<Int, TextInputEditText>()
     private val dayCaptionLayouts = mutableMapOf<Int, TextInputLayout>()
 
-    private var recommendedDurationS = VideoDurationRecommender.MIN_SECONDS
-    private var durationMultiplier = VideoDurationRecommender.DEFAULT_MULTIPLIER
-
-    /** What a pending photo-picker launch is for. */
-    private sealed class PickTarget {
-        object Cover : PickTarget()
-        data class Stop(val index: Int) : PickTarget()
-        data class Day(val dayIndex: Int) : PickTarget()
-    }
-
-    private var pendingPickTarget: PickTarget? = null
-
     private val pickImageLauncher = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        val target = pendingPickTarget
-        pendingPickTarget = null
+        val target = viewModel.pendingPickTarget
+        viewModel.pendingPickTarget = null
         if (uri != null && target != null) onImagePicked(target, uri)
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
-
-        rideId = requireArguments().getLong(ARG_RIDE_ID)
-        renderType = RenderType.valueOf(requireArguments().getString(ARG_RENDER_TYPE)!!)
-        repository = RideRepository(requireContext())
 
         view.findViewById<TextView>(R.id.topBarTitle).setText(
             if (renderType == RenderType.VIDEO) R.string.render_edit_title_video else R.string.render_edit_title_image
@@ -137,13 +118,26 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
         coverImageButton.setOnClickListener { launchPicker(PickTarget.Cover) }
         coverImageRemoveButton.setOnClickListener { clearCoverImage() }
         generateButton.setOnClickListener { onGenerateClicked() }
-        dayLabelsCheckbox.setOnCheckedChangeListener { _, isChecked -> setDayCaptionsVisible(isChecked) }
+
+        // Restore saved state into the controls *before* attaching listeners, so restoring
+        // doesn't get recorded back as a new edit.
+        dayLabelsCheckbox.isChecked = viewModel.dayLabelsEnabled
+        dayLabelsCheckbox.setOnCheckedChangeListener { _, isChecked ->
+            viewModel.dayLabelsEnabled = isChecked
+            setDayCaptionsVisible(isChecked)
+        }
 
         if (isVideo) {
-            videoLengthSlider.value = durationMultiplier
+            videoLengthSlider.value = viewModel.durationMultiplier
             videoLengthSlider.addOnChangeListener { _, value, _ ->
-                durationMultiplier = value
+                viewModel.durationMultiplier = value
                 updateVideoLengthPreview()
+            }
+        }
+
+        viewModel.coverImagePath?.let { path ->
+            viewLifecycleOwner.lifecycleScope.launch {
+                loadThumbnail(path)?.let { showCoverImage(it) }
             }
         }
 
@@ -152,25 +146,23 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
 
     private fun loadEditRows() {
         viewLifecycleOwner.lifecycleScope.launch {
-            rideDays = repository.getRideDays(rideId)
-            useDayRows = renderType == RenderType.VIDEO && rideDays.size > 1
-            stops = mergedStopsForRide(repository, rideId)
-            if (renderType == RenderType.VIDEO) {
-                recommendedDurationS = VideoDurationRecommender.recommend(stops.size)
-                updateVideoLengthPreview()
-            }
+            viewModel.load()
+            if (renderType == RenderType.VIDEO) updateVideoLengthPreview()
 
-            videoBackgroundHint.visibility = if (renderType == RenderType.VIDEO && !useDayRows) View.VISIBLE else View.GONE
-            daySection.visibility = if (useDayRows) View.VISIBLE else View.GONE
+            videoBackgroundHint.visibility =
+                if (renderType == RenderType.VIDEO && !viewModel.useDayRows) View.VISIBLE else View.GONE
+            daySection.visibility = if (viewModel.useDayRows) View.VISIBLE else View.GONE
 
-            if (useDayRows) {
-                daysContainer.removeAllViews()
-                val assembler = RideRenderDataAssembler(repository)
-                rideDays.forEach { day -> daysContainer.addView(buildDayRow(day, assembler)) }
+            daysContainer.removeAllViews()
+            dayThumbnails.clear()
+            dayCaptionLayouts.clear()
+            if (viewModel.useDayRows) {
+                viewModel.rideDays.forEach { day -> daysContainer.addView(buildDayRow(day)) }
             }
 
             stopsContainer.removeAllViews()
-            if (stops.isEmpty()) {
+            stopThumbnails.clear()
+            if (viewModel.stops.isEmpty()) {
                 val empty = TextView(requireContext()).apply {
                     text = getString(R.string.render_edit_stops_empty)
                     setTextColor(ContextCompat.getColor(requireContext(), R.color.md_on_surface_variant))
@@ -178,11 +170,11 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
                 stopsContainer.addView(empty)
                 return@launch
             }
-            stops.forEachIndexed { index, stop -> stopsContainer.addView(buildStopRow(index, stop)) }
+            viewModel.stops.forEachIndexed { index, stop -> stopsContainer.addView(buildStopRow(index, stop)) }
         }
     }
 
-    private fun buildDayRow(day: RideDay, assembler: RideRenderDataAssembler): View {
+    private fun buildDayRow(day: RideDay): View {
         val row = LayoutInflater.from(requireContext()).inflate(R.layout.item_day_photo_row, daysContainer, false)
         val thumbnail = row.findViewById<ImageView>(R.id.rowThumbnail)
         val title = row.findViewById<TextView>(R.id.rowDayTitle)
@@ -202,9 +194,10 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
 
         thumbnail.setOnClickListener { launchPicker(PickTarget.Day(day.dayIndex)) }
         dayThumbnails[day.dayIndex] = thumbnail
+        viewModel.dayBackgroundPaths[day.dayIndex]?.let { path -> restoreThumbnail(thumbnail, path) }
 
-        captionInput.setText(assembler.defaultDayCaption(day))
-        dayCaptionInputs[day.dayIndex] = captionInput
+        captionInput.setText(viewModel.dayCaption(day.dayIndex))
+        captionInput.doAfterTextChanged { viewModel.setDayCaption(day.dayIndex, it?.toString().orEmpty()) }
         dayCaptionLayouts[day.dayIndex] = captionLayout
         captionLayout.visibility = if (dayLabelsCheckbox.isChecked) View.VISIBLE else View.GONE
 
@@ -230,20 +223,24 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
             stop.placeName ?: getString(R.string.unknown_location),
             timeFormat.format(stop.timestamp)
         )
-        nameInput.setText(stop.placeName ?: "")
+        nameInput.setText(viewModel.stopName(index))
+        nameInput.doAfterTextChanged { viewModel.setStopName(index, it?.toString().orEmpty()) }
 
         // Once a ride has day rows, photos are assigned per day instead — no per-stop photo picker.
-        if (renderType == RenderType.VIDEO && !useDayRows) {
+        if (renderType == RenderType.VIDEO && !viewModel.useDayRows) {
             thumbnail.visibility = View.VISIBLE
             thumbnail.setOnClickListener { launchPicker(PickTarget.Stop(index)) }
             stopThumbnails[index] = thumbnail
+            viewModel.stopBackgroundPaths[index]?.let { path -> restoreThumbnail(thumbnail, path) }
         } else {
             thumbnail.visibility = View.GONE
         }
-        stopNameInputs[index] = nameInput
 
+        val included = index !in viewModel.excludedStopIndices
+        includeCheckbox.isChecked = included
+        setStopRowIncluded(row, thumbnail, nameInput, included)
         includeCheckbox.setOnCheckedChangeListener { _, isChecked ->
-            if (isChecked) excludedStopIndices.remove(index) else excludedStopIndices.add(index)
+            if (isChecked) viewModel.excludedStopIndices.remove(index) else viewModel.excludedStopIndices.add(index)
             setStopRowIncluded(row, thumbnail, nameInput, isChecked)
         }
 
@@ -260,21 +257,22 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
     }
 
     private fun updateVideoLengthPreview() {
-        val finalSeconds = VideoDurationRecommender.apply(recommendedDurationS, durationMultiplier)
-        val isDefault = kotlin.math.abs(durationMultiplier - VideoDurationRecommender.DEFAULT_MULTIPLIER) < 0.01f
+        val finalSeconds = viewModel.videoDurationSeconds
+        val multiplier = viewModel.durationMultiplier
+        val isDefault = kotlin.math.abs(multiplier - VideoDurationRecommender.DEFAULT_MULTIPLIER) < 0.01f
         videoLengthValueText.text = if (isDefault) {
             getString(R.string.render_edit_length_value_recommended_format, finalSeconds)
         } else {
             getString(
                 R.string.render_edit_length_value_multiplier_format,
                 finalSeconds,
-                String.format(Locale.US, "%.1fx", durationMultiplier)
+                String.format(Locale.US, "%.1fx", multiplier)
             )
         }
     }
 
     private fun launchPicker(target: PickTarget) {
-        pendingPickTarget = target
+        viewModel.pendingPickTarget = target
         pickImageLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
     }
 
@@ -288,9 +286,7 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
             // Decode the thumbnail from the copy we just made, not the picker's uri — a photo
             // picker's content:// grant can fail to re-open by the time this runs, which
             // setImageURI(uri) swallows silently (leaving the slot blank instead of erroring).
-            val thumbnail = runCatching {
-                RenderImageStorage.decodeSampledBitmap(path, THUMBNAIL_SIZE_PX, THUMBNAIL_SIZE_PX)
-            }.getOrNull()
+            val thumbnail = loadThumbnail(path)
             if (thumbnail == null) {
                 // Decoding failed (corrupt copy, unsupported format, oversized source) — treat this
                 // exactly like the copy failure above rather than silently recording a path that
@@ -298,37 +294,55 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
                 Toast.makeText(requireContext(), R.string.render_image_failed, Toast.LENGTH_SHORT).show()
                 return@launch
             }
-            val thumbnailView = when (target) {
+            // The path goes into the ViewModel even if the row's view isn't built yet (or was just
+            // rebuilt by a rotation) — the row picks it up from there when it is.
+            when (target) {
                 is PickTarget.Cover -> {
-                    coverImagePath = path
-                    coverImagePreview.setImageBitmap(thumbnail)
-                    coverImagePreview.visibility = View.VISIBLE
-                    coverImageButton.setText(R.string.render_edit_change_photo)
-                    coverImageRemoveButton.visibility = View.VISIBLE
-                    null
+                    viewModel.coverImagePath = path
+                    showCoverImage(thumbnail)
                 }
                 is PickTarget.Stop -> {
-                    stopBackgroundPaths[target.index] = path
-                    stopThumbnails[target.index]
+                    viewModel.stopBackgroundPaths[target.index] = path
+                    stopThumbnails[target.index]?.let { applyThumbnail(it, thumbnail) }
                 }
                 is PickTarget.Day -> {
-                    dayBackgroundPaths[target.dayIndex] = path
-                    dayThumbnails[target.dayIndex]
+                    viewModel.dayBackgroundPaths[target.dayIndex] = path
+                    dayThumbnails[target.dayIndex]?.let { applyThumbnail(it, thumbnail) }
                 }
-            }
-            thumbnailView?.apply {
-                scaleType = ImageView.ScaleType.CENTER_CROP
-                setPadding(0, 0, 0, 0)
-                // The layout's app:tint (for the placeholder "+" icon) otherwise carries over and
-                // flattens the actual photo into a solid tinted block instead of showing it.
-                imageTintList = null
-                setImageBitmap(thumbnail)
             }
         }
     }
 
+    private suspend fun loadThumbnail(path: String): Bitmap? =
+        runCatching { RenderImageStorage.decodeSampledBitmap(path, THUMBNAIL_SIZE_PX, THUMBNAIL_SIZE_PX) }.getOrNull()
+
+    /** Re-shows an already-picked photo on a freshly built row. A photo that no longer decodes just leaves the slot blank. */
+    private fun restoreThumbnail(view: ImageView, path: String) {
+        viewLifecycleOwner.lifecycleScope.launch {
+            loadThumbnail(path)?.let { applyThumbnail(view, it) }
+        }
+    }
+
+    private fun applyThumbnail(view: ImageView, thumbnail: Bitmap) {
+        view.apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setPadding(0, 0, 0, 0)
+            // The layout's app:tint (for the placeholder "+" icon) otherwise carries over and
+            // flattens the actual photo into a solid tinted block instead of showing it.
+            imageTintList = null
+            setImageBitmap(thumbnail)
+        }
+    }
+
+    private fun showCoverImage(thumbnail: Bitmap) {
+        coverImagePreview.setImageBitmap(thumbnail)
+        coverImagePreview.visibility = View.VISIBLE
+        coverImageButton.setText(R.string.render_edit_change_photo)
+        coverImageRemoveButton.visibility = View.VISIBLE
+    }
+
     private fun clearCoverImage() {
-        coverImagePath = null
+        viewModel.coverImagePath = null
         coverImagePreview.setImageBitmap(null)
         coverImagePreview.visibility = View.GONE
         coverImageButton.setText(R.string.render_edit_add_photo)
@@ -336,7 +350,7 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
     }
 
     private fun onGenerateClicked() {
-        val nameOverrides = stopNameInputs.mapValues { (_, field) -> field.text?.toString().orEmpty() }
+        val nameOverrides = viewModel.stopNameOverrides()
         generateButton.isEnabled = false
 
         when (renderType) {
@@ -356,11 +370,11 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
             val renderId = renderRepository.insertQueued(rideId, RenderType.IMAGE)
             renderRepository.markProcessing(renderId)
 
-            val data = RideRenderDataAssembler(repository).assemble(
+            val data = RideRenderDataAssembler(viewModel.repository).assemble(
                 rideId = rideId,
                 stopNameOverrides = nameOverrides,
-                excludedStopIndices = excludedStopIndices,
-                coverImagePath = coverImagePath
+                excludedStopIndices = viewModel.excludedStopIndices,
+                coverImagePath = viewModel.coverImagePath
             )
             val output = data?.let { runCatching { StaticImageRenderer(requireContext()).render(it) }.getOrNull() }
             generateButton.isEnabled = true
@@ -375,15 +389,13 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
     }
 
     private fun generateVideo(nameOverrides: Map<Int, String>) {
-        val stopCount = stops.size
+        val stopCount = viewModel.stops.size
         val namesArray: Array<String?> = Array(stopCount) { i -> nameOverrides[i].orEmpty() }
-        val backgroundsArray: Array<String?> = Array(stopCount) { i -> stopBackgroundPaths[i].orEmpty() }
+        val backgroundsArray: Array<String?> = Array(stopCount) { i -> viewModel.stopBackgroundPaths[i].orEmpty() }
 
-        val dayCount = rideDays.size
-        val dayBackgroundsArray: Array<String?> = Array(dayCount) { i -> dayBackgroundPaths[i].orEmpty() }
-        val dayCaptionsArray: Array<String?> = Array(dayCount) { i ->
-            dayCaptionInputs[i]?.text?.toString().orEmpty()
-        }
+        val dayCount = viewModel.rideDays.size
+        val dayBackgroundsArray: Array<String?> = Array(dayCount) { i -> viewModel.dayBackgroundPaths[i].orEmpty() }
+        val dayCaptionsArray: Array<String?> = Array(dayCount) { i -> viewModel.dayCaption(i) }
 
         val request = OneTimeWorkRequestBuilder<VideoRenderWorker>()
             .setInputData(
@@ -391,14 +403,11 @@ class RenderEditFragment : Fragment(R.layout.fragment_render_edit) {
                     .putLong(VideoRenderWorker.KEY_RIDE_ID, rideId)
                     .putStringArray(VideoRenderWorker.KEY_STOP_NAMES, namesArray)
                     .putStringArray(VideoRenderWorker.KEY_STOP_BACKGROUNDS, backgroundsArray)
-                    .putIntArray(VideoRenderWorker.KEY_EXCLUDED_STOPS, excludedStopIndices.toIntArray())
+                    .putIntArray(VideoRenderWorker.KEY_EXCLUDED_STOPS, viewModel.excludedStopIndices.toIntArray())
                     .putStringArray(VideoRenderWorker.KEY_DAY_BACKGROUNDS, dayBackgroundsArray)
                     .putStringArray(VideoRenderWorker.KEY_DAY_CAPTIONS, dayCaptionsArray)
-                    .putBoolean(VideoRenderWorker.KEY_DAY_LABELS_ENABLED, useDayRows && dayLabelsCheckbox.isChecked)
-                    .putInt(
-                        VideoRenderWorker.KEY_DURATION_SECONDS,
-                        VideoDurationRecommender.apply(recommendedDurationS, durationMultiplier)
-                    )
+                    .putBoolean(VideoRenderWorker.KEY_DAY_LABELS_ENABLED, viewModel.useDayRows && viewModel.dayLabelsEnabled)
+                    .putInt(VideoRenderWorker.KEY_DURATION_SECONDS, viewModel.videoDurationSeconds)
                     .build()
             )
             .build()
