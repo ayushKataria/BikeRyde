@@ -39,6 +39,7 @@ dependencies {
     implementation(libs.material)
     implementation(libs.androidx.lifecycle.service)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.viewmodel.ktx)
     implementation(libs.play.services.location)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.navigation.fragment.ktx)
