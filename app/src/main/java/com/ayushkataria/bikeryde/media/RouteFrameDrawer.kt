@@ -2,6 +2,7 @@ package com.ayushkataria.bikeryde.media
 
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
 import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
@@ -15,6 +16,7 @@ import com.ayushkataria.bikeryde.ride.RidePoint
 import com.ayushkataria.bikeryde.ride.RouteProjection
 import java.util.Locale
 import kotlin.math.ceil
+import kotlin.math.hypot
 import kotlin.math.min
 
 /**
@@ -83,7 +85,14 @@ object RouteFrameDrawer {
     private fun stopRevealPointIndex(stopIndex: Int, totalStops: Int, totalPoints: Int): Float =
         (stopIndex.toFloat() / (totalStops - 1).coerceAtLeast(1)) * (totalPoints - 1)
 
-    private class StopEntry(val revealIndex: Float, val point: PointF, val color: Int, val label: String?)
+    /** [isEndpoint] marks a ride's START/END stop — its label gets first pick of placement spots. */
+    private class StopEntry(
+        val revealIndex: Float,
+        val point: PointF,
+        val color: Int,
+        val label: String?,
+        val isEndpoint: Boolean
+    )
 
     /** A pre-built, pre-colored chunk of the route line — [path] spans point indices
      * [startIndex]..[endIndex] inclusive and is reused every frame once fully revealed; only the
@@ -169,7 +178,8 @@ object RouteFrameDrawer {
                         RideEventAction.END -> endColor
                         RideEventAction.PAUSE, RideEventAction.RESUME -> pauseResumeColor
                     },
-                    label = stop.displayName
+                    label = stop.displayName,
+                    isEndpoint = stop.action == RideEventAction.START || stop.action == RideEventAction.END
                 )
             }
         } else emptyList()
@@ -261,6 +271,47 @@ object RouteFrameDrawer {
             typeface = Typeface.DEFAULT_BOLD
         }
         private val captionBarPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#99000000") }
+
+        /** Dotted line tying a label that had to be pushed away from a crowded spot back to its marker. */
+        private val leaderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = routeBounds.width() * 0.005f
+            strokeCap = Paint.Cap.ROUND
+            pathEffect = DashPathEffect(floatArrayOf(0.1f, strokeWidth * 2.6f), 0f)
+            color = if (usesPhoto) Color.WHITE else darkLabelColor
+        }
+        private val stopLabelPad = markerRadius * 0.5f
+
+        /**
+         * Each stop's label position, laid out once for the whole render (see [StopLabelLayout]) so
+         * labels never collide and never move between video frames — parallel to [stopEntries].
+         * Labels stay out of the header/stats bands and, when day captions are on, the caption bar.
+         * A place repeated at the same spot (a loop ride's start and end) gets just one label.
+         */
+        private val labelPlacements: List<LabelPlacement?> = run {
+            val sizes = stopEntries.map { entry ->
+                entry.label?.let { name ->
+                    LabelSize(
+                        width = stopLabelPaint.measureText(name) + stopLabelPad * 2f,
+                        height = stopLabelPaint.descent() - stopLabelPaint.ascent() + stopLabelPad * 2f
+                    )
+                }
+            }
+            val captionObstacles = if (data.days.any { !it.caption.isNullOrBlank() }) {
+                val barBottom = routeBounds.bottom - routeBounds.height() * 0.05f
+                listOf(RectF(routeBounds.left, barBottom - captionBaseTextSize * 2.3f, routeBounds.right, barBottom))
+            } else emptyList()
+            val anchors = stopEntries.map { it.point }
+            StopLabelLayout.layout(
+                anchors = anchors,
+                sizes = StopLabelLayout.withoutDuplicateLabels(anchors, stopEntries.map { it.label }, sizes, markerRadius),
+                order = stopEntries.indices.sortedBy { if (stopEntries[it].isEndpoint) 0 else 1 },
+                markerRadius = markerRadius,
+                bounds = RectF(margin * 0.5f, headerBottom, width - margin * 0.5f, footerTop),
+                obstacles = captionObstacles,
+                routePoints = projectedPoints
+            )
+        }
 
         /**
          * @param dayIndex which day's segment this frame belongs to (see [VideoTimeline]) — a
@@ -380,27 +431,31 @@ object RouteFrameDrawer {
             canvas.drawCircle(head.x, head.y, currentPositionRadius, currentPositionRingPaint)
         }
 
+        /** Leader lines first, then markers, then labels — so a label is never covered by a later
+         * marker or another label's leader line. */
         private fun drawStops(canvas: Canvas, visibleCount: Int) {
-            for (entry in stopEntries) {
-                if (entry.revealIndex > visibleCount - 1) continue
+            val visible = stopEntries.indices.filter { stopEntries[it].revealIndex <= visibleCount - 1 }
+            for (i in visible) {
+                val placement = labelPlacements[i]?.takeIf { it.needsLeader } ?: continue
+                val anchor = stopEntries[i].point
+                val end = StopLabelLayout.leaderEnd(anchor, placement.rect)
+                val length = hypot(end.x - anchor.x, end.y - anchor.y)
+                if (length <= markerRadius) continue
+                val startX = anchor.x + (end.x - anchor.x) / length * markerRadius
+                val startY = anchor.y + (end.y - anchor.y) / length * markerRadius
+                canvas.drawLine(startX, startY, end.x, end.y, leaderPaint)
+            }
+            for (i in visible) {
+                val entry = stopEntries[i]
                 markerPaint.color = entry.color
                 canvas.drawCircle(entry.point.x, entry.point.y, markerRadius, markerPaint)
                 canvas.drawCircle(entry.point.x, entry.point.y, markerRadius, markerStrokePaint)
-                entry.label?.let { name ->
-                    val labelY = entry.point.y - markerRadius * 1.8f
-                    val textWidth = stopLabelPaint.measureText(name)
-                    val pad = markerRadius * 0.5f
-                    canvas.drawRoundRect(
-                        entry.point.x - textWidth / 2f - pad,
-                        labelY + stopLabelPaint.ascent() - pad,
-                        entry.point.x + textWidth / 2f + pad,
-                        labelY + stopLabelPaint.descent() + pad,
-                        pad,
-                        pad,
-                        stopLabelBackgroundPaint
-                    )
-                    canvas.drawText(name, entry.point.x, labelY, stopLabelPaint)
-                }
+            }
+            for (i in visible) {
+                val name = stopEntries[i].label ?: continue
+                val rect = labelPlacements[i]?.rect ?: continue
+                canvas.drawRoundRect(rect, stopLabelPad, stopLabelPad, stopLabelBackgroundPaint)
+                canvas.drawText(name, rect.centerX(), rect.top + stopLabelPad - stopLabelPaint.ascent(), stopLabelPaint)
             }
         }
 
