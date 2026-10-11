@@ -188,4 +188,18 @@
     <string name="log_rest_day_confirm_title">Log a rest day?</string>
     <string name="log_rest_day_confirm_message">Marks today as a day spent at your current stop, with no riding — for a rest day or sightseeing.</string>
     <string name="multi_day_permission_required">Location permission is required to track your trip.</string>
+
+    <!-- Combine single-day rides into a multi-day ride -->
+    <string name="ride_history_action_combine">Combine into multi-day ride</string>
+    <string name="combine_title">Combine Rides</string>
+    <string name="combine_section_rides">Single-day rides</string>
+    <string name="combine_section_rides_hint">Pick at least two rides to make into one multi-day trip. Days are ordered by date.</string>
+    <string name="combine_section_days_hint">Add rest or sightseeing days after any day of riding.</string>
+    <string name="combine_empty">You need at least two completed single-day rides to combine.</string>
+    <string name="combine_add_rest_day">Add rest day</string>
+    <string name="combine_remove_rest_day">Remove rest day</string>
+    <string name="combine_title_hint">Trip name (optional)</string>
+    <string name="combine_delete_originals">Remove the original single-day rides</string>
+    <string name="combine_action_create">Create Multi-Day Ride</string>
+    <string name="combine_failed">Couldn\'t combine these rides. Please try again.</string>
 </resources>

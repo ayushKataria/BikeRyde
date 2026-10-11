@@ -42,11 +42,31 @@
         app:layout_constraintTop_toBottomOf="@id/topBar">
 
         <LinearLayout
-            android:id="@+id/rideListContainer"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:orientation="vertical" />
+            android:orientation="vertical">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/combineRidesButton"
+                style="@style/Widget.Material3.Button.OutlinedButton.Icon"
+                android:layout_width="match_parent"
+                android:layout_height="52dp"
+                android:layout_marginTop="8dp"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:text="@string/ride_history_action_combine"
+                android:visibility="gone"
+                app:icon="@drawable/ic_add"
+                tools:visibility="visible" />
+
+            <LinearLayout
+                android:id="@+id/rideListContainer"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="vertical" />
+
+        </LinearLayout>
 
     </ScrollView>
 

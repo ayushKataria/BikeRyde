@@ -14,6 +14,7 @@ import androidx.navigation.fragment.findNavController
 import com.ayushkataria.bikeryde.R
 import com.ayushkataria.bikeryde.ride.Ride
 import com.ayushkataria.bikeryde.ride.RideRepository
+import com.ayushkataria.bikeryde.ride.RideType
 import com.ayushkataria.bikeryde.ui.ride.RideDetailFragment
 import com.ayushkataria.bikeryde.ui.ride.RideStatsFormat
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -27,6 +28,7 @@ class RideHistoryFragment : Fragment(R.layout.fragment_ride_history) {
     private lateinit var repository: RideRepository
     private lateinit var listContainer: ViewGroup
     private lateinit var emptyStateText: View
+    private lateinit var combineRidesButton: View
 
     private val dateFormat = SimpleDateFormat("MMM d, yyyy", Locale.getDefault())
 
@@ -39,6 +41,8 @@ class RideHistoryFragment : Fragment(R.layout.fragment_ride_history) {
         repository = RideRepository(requireContext())
         listContainer = view.findViewById(R.id.rideListContainer)
         emptyStateText = view.findViewById(R.id.emptyStateText)
+        combineRidesButton = view.findViewById(R.id.combineRidesButton)
+        combineRidesButton.setOnClickListener { findNavController().navigate(R.id.action_rideHistory_to_combineRides) }
 
         loadRides()
     }
@@ -48,6 +52,8 @@ class RideHistoryFragment : Fragment(R.layout.fragment_ride_history) {
             val rides = repository.getCompletedRides()
             listContainer.removeAllViews()
             emptyStateText.visibility = if (rides.isEmpty()) View.VISIBLE else View.GONE
+            combineRidesButton.visibility =
+                if (rides.count { it.type == RideType.SINGLE_DAY } >= CombineRidesViewModel.MIN_RIDES) View.VISIBLE else View.GONE
             rides.forEach { ride -> listContainer.addView(buildRow(ride)) }
         }
     }

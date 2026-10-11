@@ -82,6 +82,22 @@
         <action
             android:id="@+id/action_rideHistory_to_rideDetail"
             app:destination="@id/rideDetailFragment" />
+        <action
+            android:id="@+id/action_rideHistory_to_combineRides"
+            app:destination="@id/combineRidesFragment" />
+    </fragment>
+
+    <fragment
+        android:id="@+id/combineRidesFragment"
+        android:name="com.ayushkataria.bikeryde.ui.history.CombineRidesFragment"
+        android:label="Combine Rides"
+        tools:layout="@layout/fragment_combine_rides">
+
+        <action
+            android:id="@+id/action_combineRides_to_rideDetail"
+            app:destination="@id/rideDetailFragment"
+            app:popUpTo="@id/combineRidesFragment"
+            app:popUpToInclusive="true" />
     </fragment>
 
     <fragment

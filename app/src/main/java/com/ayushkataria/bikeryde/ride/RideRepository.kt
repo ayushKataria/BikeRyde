@@ -159,21 +159,87 @@ class RideRepository(context: Context) {
      */
     suspend fun addNotTravelDay(rideId: Long, date: Long, placeName: String?): Long = withContext(Dispatchers.IO) {
         val db = dbHelper.writableDatabase
-        db.insert(
-            "ride_day",
-            null,
-            ContentValues().apply {
-                put("ride_id", rideId)
-                put("day_index", nextDayIndex(db, rideId))
-                put("day_type", RideDayType.NOT_TRAVEL.name)
-                put("start_time", date)
-                put("end_time", date)
-                put("start_place_name", placeName)
-                put("end_place_name", placeName)
-                put("distance_km", 0.0)
-                put("duration_s", 0L)
+        insertNotTravelDay(db, rideId, nextDayIndex(db, rideId), date, placeName)
+    }
+
+    /**
+     * Creates a new, already-[RideStatus.COMPLETED] multi-day [Ride] from completed single-day
+     * rides plus rest days, laid out in [plan] order. Each [CombineDay.Travel] entry's sole
+     * [RideDay] is *copied* — along with its [Stop]s and [GpsPoint]s — so the source rides stay in
+     * history untouched (the caller deletes them via [deleteRide] if the rider asked to). Totals
+     * are summed fresh across the new ride's days, same as [endTrip].
+     *
+     * @return the new ride's id.
+     */
+    suspend fun combineRides(plan: List<CombineDay>, title: String?): Long = withContext(Dispatchers.IO) {
+        val db = dbHelper.writableDatabase
+        db.beginTransaction()
+        try {
+            val sourceDays = plan.filterIsInstance<CombineDay.Travel>().associate { travel ->
+                travel.sourceRideId to requireNotNull(
+                    db.query(
+                        "ride_day", null, "ride_id = ?", arrayOf(travel.sourceRideId.toString()),
+                        null, null, "day_index ASC", "1"
+                    ).use { cursor -> if (cursor.moveToFirst()) cursor.toRideDay() else null }
+                ) { "Ride ${travel.sourceRideId} has no day to combine" }
             }
-        )
+            require(sourceDays.isNotEmpty()) { "A combined ride needs at least one travel day" }
+            val startTime = sourceDays.values.minOf { it.startTime }
+            val endTime = sourceDays.values.maxOf { it.endTime ?: it.startTime }
+
+            val rideId = db.insert(
+                "ride",
+                null,
+                ContentValues().apply {
+                    put("type", RideType.MULTI_DAY.name)
+                    put("start_time", startTime)
+                    put("end_time", endTime)
+                    put("status", RideStatus.COMPLETED.name)
+                    put("total_distance_m", 0.0)
+                    put("total_duration_s", 0L)
+                    put("title", title?.trim()?.takeIf { it.isNotEmpty() })
+                }
+            )
+
+            plan.forEachIndexed { dayIndex, day ->
+                when (day) {
+                    is CombineDay.Rest -> insertNotTravelDay(db, rideId, dayIndex, day.date, day.placeName)
+                    is CombineDay.Travel -> copyTravelDay(db, sourceDays.getValue(day.sourceRideId), rideId, dayIndex)
+                }
+            }
+
+            val (totalDistanceM, totalDurationS) = tripTotals(db, rideId)
+            db.update(
+                "ride",
+                ContentValues().apply {
+                    put("total_distance_m", totalDistanceM)
+                    put("total_duration_s", totalDurationS)
+                },
+                "id = ?",
+                arrayOf(rideId.toString())
+            )
+            db.setTransactionSuccessful()
+            rideId
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    /** Completed single-day rides, oldest first — the rides that can be combined via [combineRides]. */
+    suspend fun getCompletedSingleDayRides(): List<Ride> = withContext(Dispatchers.IO) {
+        dbHelper.readableDatabase.query(
+            "ride",
+            null,
+            "type = ? AND status = ?",
+            arrayOf(RideType.SINGLE_DAY.name, RideStatus.COMPLETED.name),
+            null,
+            null,
+            "start_time ASC"
+        ).use { cursor ->
+            val rides = mutableListOf<Ride>()
+            while (cursor.moveToNext()) rides += cursor.toRide()
+            rides
+        }
     }
 
     /** The trip's distance/duration so far, summed across every already-finalized [RideDay] — a
@@ -281,7 +347,7 @@ class RideRepository(context: Context) {
             FROM gps_point
             JOIN ride_day ON gps_point.ride_day_id = ride_day.id
             WHERE ride_day.ride_id = ?
-            ORDER BY gps_point.id ASC
+            ORDER BY ride_day.day_index ASC, gps_point.id ASC
             """.trimIndent(),
             arrayOf(rideId.toString())
         ).use { cursor ->
@@ -305,7 +371,7 @@ class RideRepository(context: Context) {
             FROM stop
             JOIN ride_day ON stop.ride_day_id = ride_day.id
             WHERE ride_day.ride_id = ?
-            ORDER BY stop.id ASC
+            ORDER BY ride_day.day_index ASC, stop.id ASC
             """.trimIndent(),
             arrayOf(rideId.toString())
         ).use { cursor ->
@@ -572,6 +638,62 @@ class RideRepository(context: Context) {
         )
         insertStop(db, rideDayId, RideEventAction.START, startTime, lat, lng, placeName)
         return rideDayId
+    }
+
+    private fun insertNotTravelDay(
+        db: SQLiteDatabase,
+        rideId: Long,
+        dayIndex: Int,
+        date: Long,
+        placeName: String?
+    ): Long = db.insert(
+        "ride_day",
+        null,
+        ContentValues().apply {
+            put("ride_id", rideId)
+            put("day_index", dayIndex)
+            put("day_type", RideDayType.NOT_TRAVEL.name)
+            put("start_time", date)
+            put("end_time", date)
+            put("start_place_name", placeName)
+            put("end_place_name", placeName)
+            put("distance_km", 0.0)
+            put("duration_s", 0L)
+        }
+    )
+
+    /** Copies [source] — and every [Stop] and [GpsPoint] hanging off it, in recording order — into
+     * [rideId] as its day [dayIndex]. Used by [combineRides]. */
+    private fun copyTravelDay(db: SQLiteDatabase, source: RideDay, rideId: Long, dayIndex: Int) {
+        val newDayId = db.insert(
+            "ride_day",
+            null,
+            ContentValues().apply {
+                put("ride_id", rideId)
+                put("day_index", dayIndex)
+                put("day_type", source.dayType.name)
+                put("start_time", source.startTime)
+                if (source.endTime == null) putNull("end_time") else put("end_time", source.endTime)
+                put("start_place_name", source.startPlaceName)
+                put("end_place_name", source.endPlaceName)
+                put("distance_km", source.distanceKm)
+                put("duration_s", source.durationS)
+            }
+        )
+        db.execSQL(
+            """
+            INSERT INTO stop (ride_day_id, "action", timestamp, lat, lng, place_name)
+            SELECT ?, "action", timestamp, lat, lng, place_name FROM stop WHERE ride_day_id = ? ORDER BY id ASC
+            """.trimIndent(),
+            arrayOf(newDayId, source.id)
+        )
+        db.execSQL(
+            """
+            INSERT INTO gps_point (ride_day_id, timestamp, lat, lng, elevation, speed)
+            SELECT ?, timestamp, lat, lng, elevation, speed FROM gps_point WHERE ride_day_id = ? ORDER BY id ASC
+            """.trimIndent(),
+            arrayOf(newDayId, source.id)
+        )
     }
 
     private fun finalizeDay(

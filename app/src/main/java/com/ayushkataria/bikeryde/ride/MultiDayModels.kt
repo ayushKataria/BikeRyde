@@ -54,3 +54,15 @@ data class GpsPoint(
     val elevation: Double?,
     val speed: Float?
 )
+
+/**
+ * One day in a plan for combining completed single-day rides into a multi-day [Ride] — see
+ * [RideRepository.combineRides]. The plan's list order is the new ride's [RideDay.dayIndex] order.
+ */
+sealed interface CombineDay {
+    /** The sole TRAVEL [RideDay] of the single-day ride [sourceRideId], copied into the new ride. */
+    data class Travel(val sourceRideId: Long) : CombineDay
+
+    /** A [RideDayType.NOT_TRAVEL] day spent at [placeName] on [date]. */
+    data class Rest(val date: Long, val placeName: String?) : CombineDay
+}

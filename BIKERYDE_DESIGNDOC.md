@@ -167,6 +167,10 @@ aiMode (LOCAL | CLOUD), driveSyncEnabled (Boolean), units (KM | MI)
   the current stop, with no start/pause/end tracking. This creates a `NOT_TRAVEL` `RideDay` (same
   start/end place, zero distance/duration) so trip summaries and the multi-day video can label it
   distinctly from a travel day, instead of it just appearing as an untracked gap between two days
+- A trip recorded one day at a time as **single-day rides** can be combined afterwards from Ride
+  History: pick two or more completed single-day rides (ordered by date), optionally insert
+  `NOT_TRAVEL` days after any of them, and a new completed multi-day ride is created with copies of
+  their days, stops and GPS points. The originals are kept unless the rider opts to remove them
 
 **Still-riding safety check:** while a day-segment is active, if no significant GPS movement is detected for 30+ minutes (checked via a periodic `WorkManager` task or timer inside the foreground service), fire a notification: "Still riding? Tap to keep tracking, or end your day."
 
